@@ -3,90 +3,78 @@ package sharding
 import (
 	"context"
 	"database/sql"
-	"time"
-
+	"errors"
 	"gorm.io/gorm"
 )
 
-// ConnPool Implement a ConnPool for replace db.Statement.ConnPool in Gorm
+// ConnPool implements a ConnPool to replace db.Statement.ConnPool in GORM
 type ConnPool struct {
-	// db, This is global db instance
 	sharding *Sharding
-	gorm.ConnPool
+	ConnPool gorm.ConnPool
 }
 
 func (pool *ConnPool) String() string {
 	return "gorm:sharding:conn_pool"
 }
 
-func (pool ConnPool) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+func (pool *ConnPool) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
 	return pool.ConnPool.PrepareContext(ctx, query)
 }
 
-func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	var (
-		curTime = time.Now()
-	)
-
-	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
+func (pool *ConnPool) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	// Resolve the query using the sharding plugin
+	_, stQuery, _, err := pool.sharding.resolve(query, args...)
 	if err != nil {
-		return nil, err
-	}
-
-	pool.sharding.querys.Store("last_query", stQuery)
-
-	if table != "" {
-		if r, ok := pool.sharding.configs[table]; ok {
-			if r.DoubleWrite {
-				pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-					result, _ := pool.ConnPool.ExecContext(ctx, ftQuery, args...)
-					rowsAffected, _ = result.RowsAffected()
-					return pool.sharding.Explain(ftQuery, args...), rowsAffected
-				}, pool.sharding.Error)
-			}
+		if errors.Is(err, ErrMissingShardingKey) {
+			stQuery = query
+		} else {
+			return nil, err
 		}
 	}
 
-	var result sql.Result
-	result, err = pool.ConnPool.ExecContext(ctx, stQuery, args...)
-	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-		rowsAffected, _ = result.RowsAffected()
-		return pool.sharding.Explain(stQuery, args...), rowsAffected
-	}, pool.sharding.Error)
+	// Store the modified query
+	pool.sharding.querys.Store("last_query", stQuery)
 
+	// Execute the modified query
+	result, err := pool.ConnPool.ExecContext(ctx, stQuery, args...)
 	return result, err
 }
 
-// https://github.com/go-gorm/gorm/blob/v1.21.11/callbacks/query.go#L18
-func (pool ConnPool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	var (
-		curTime = time.Now()
-	)
-
+func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	_, stQuery, _, err := pool.sharding.resolve(query, args...)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, ErrMissingShardingKey) {
+			stQuery = query
+		} else {
+			return nil, err
+		}
 	}
 
 	pool.sharding.querys.Store("last_query", stQuery)
 
-	var rows *sql.Rows
-	rows, err = pool.ConnPool.QueryContext(ctx, stQuery, args...)
-	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-		return pool.sharding.Explain(stQuery, args...), 0
-	}, pool.sharding.Error)
-
+	rows, err := pool.ConnPool.QueryContext(ctx, stQuery, args...)
 	return rows, err
 }
 
-func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	_, query, _, _ = pool.sharding.resolve(query, args...)
-	pool.sharding.querys.Store("last_query", query)
+func (pool *ConnPool) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	_, stQuery, _, err := pool.sharding.resolve(query, args...)
+	if err != nil {
+		if errors.Is(err, ErrMissingShardingKey) {
+			// Proceed with the original query if sharding key is missing
+			stQuery = query
+		} else {
+			// Log the error and proceed with the original query
+			pool.sharding.Logger.Error(ctx, "sharding resolve error: %v", err)
+			stQuery = query
+		}
+	}
 
-	return pool.ConnPool.QueryRowContext(ctx, query, args...)
+	pool.sharding.querys.Store("last_query", stQuery)
+
+	return pool.ConnPool.QueryRowContext(ctx, stQuery, args...)
 }
 
-// BeginTx Implement ConnPoolBeginner.BeginTx
+// BeginTx implements ConnPoolBeginner.BeginTx
 func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.ConnPool, error) {
 	if basePool, ok := pool.ConnPool.(gorm.ConnPoolBeginner); ok {
 		return basePool.BeginTx(ctx, opt)
@@ -95,7 +83,7 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 	return pool, nil
 }
 
-// Implement TxCommitter.Commit
+// Commit implements TxCommitter.Commit
 func (pool *ConnPool) Commit() error {
 	if _, ok := pool.ConnPool.(*sql.Tx); ok {
 		return nil
@@ -108,7 +96,7 @@ func (pool *ConnPool) Commit() error {
 	return nil
 }
 
-// Implement TxCommitter.Rollback
+// Rollback implements TxCommitter.Rollback
 func (pool *ConnPool) Rollback() error {
 	if _, ok := pool.ConnPool.(*sql.Tx); ok {
 		return nil

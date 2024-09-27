@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,13 +23,6 @@ var (
 var (
 	ShardingIgnoreStoreKey = "sharding_ignore"
 )
-
-type ASTNode interface{}
-
-type SQLParser interface {
-	Parse(query string) (ASTNode, error)
-	ReplaceTableNames(ast ASTNode, replacements map[string]string) (string, error)
-}
 
 type Sharding struct {
 	*gorm.DB
@@ -123,11 +116,11 @@ func (s *Sharding) compile() error {
 	}
 	for _, table := range s._tables {
 		if t, ok := table.(string); ok {
-			s.configs[t] = s._config
+			s.configs[strings.ToLower(t)] = s._config
 		} else {
 			stmt := &gorm.Statement{DB: s.DB}
 			if err := stmt.Parse(table); err == nil {
-				s.configs[stmt.Table] = s._config
+				s.configs[strings.ToLower(stmt.Table)] = s._config
 			} else {
 				return err
 			}
@@ -245,9 +238,15 @@ func (s *Sharding) LastQuery() string {
 
 // Initialize implement for Gorm plugin interface
 func (s *Sharding) Initialize(db *gorm.DB) error {
-	db.Dialector = NewShardingDialector(db.Dialector, s)
-
+	fmt.Println("Sharding plugin initialized")
 	s.DB = db
+
+	// First, compile the configurations
+	if err := s.compile(); err != nil {
+		return err
+	}
+
+	db.Dialector = NewShardingDialector(db.Dialector, s)
 	s.registerCallbacks(db)
 
 	for t, c := range s.configs {
@@ -278,7 +277,7 @@ func (s *Sharding) Initialize(db *gorm.DB) error {
 		s.snowflakeNodes[i] = n
 	}
 
-	return s.compile()
+	return nil
 }
 
 func (s *Sharding) registerCallbacks(db *gorm.DB) {
@@ -291,14 +290,23 @@ func (s *Sharding) registerCallbacks(db *gorm.DB) {
 }
 
 func (s *Sharding) switchConn(db *gorm.DB) {
+	fmt.Println("Sharding switchConn called")
+
+	// Skip sharding for GORM's internal queries
+	if db.Statement == nil || db.Statement.SQL.String() == "" {
+		return
+	}
+
 	// Support ignore sharding in some case, like:
 	// When DoubleWrite is enabled, we need to query database schema
 	// information by table name during the migration.
 	if _, ok := db.Get(ShardingIgnoreStoreKey); !ok {
 		s.mutex.Lock()
 		if db.Statement.ConnPool != nil {
-			s.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
-			db.Statement.ConnPool = s.ConnPool
+			if _, ok := s.configs[db.Statement.Table]; ok {
+				// Only set ConnPool for sharded tables
+				db.Statement.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
+			}
 		}
 		s.mutex.Unlock()
 	}
@@ -323,12 +331,32 @@ func (v *tableNameCollector) VisitEnd(node sqlparser.Node) error {
 }
 
 // Collect all table names from the AST
-func collectTableNames(node sqlparser.Node) []*sqlparser.TableName {
-	collector := &tableNameCollector{}
-	sqlparser.Walk(collector, node)
-	return collector.tables
+func collectTableNames(stmt sqlparser.Statement) []*sqlparser.TableName {
+	var tables []*sqlparser.TableName
+
+	// Get the root source from the statement
+	source := sqlparser.StatementSource(stmt)
+	if source != nil {
+		// Use ForEachSource to traverse all sources
+		sqlparser.ForEachSource(source, func(s sqlparser.Source) bool {
+			if table, ok := s.(*sqlparser.TableName); ok {
+				tables = append(tables, table)
+			}
+			return true
+		})
+	}
+
+	// Additionally, handle InsertStatement's TableName
+	if insertStmt, ok := stmt.(*sqlparser.InsertStatement); ok {
+		if insertStmt.TableName != nil {
+			tables = append(tables, insertStmt.TableName)
+		}
+	}
+
+	return tables
 }
 
+// Inside the resolve function
 func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery, tableName string, err error) {
 	ftQuery = query
 	stQuery = query
@@ -337,75 +365,139 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 	}
 
 	// Parse the SQL query into an AST
-	var expr sqlparser.Statement
-	expr, err = sqlparser.NewParser(strings.NewReader(query)).ParseStatement()
+	parser := sqlparser.NewParser(strings.NewReader(query))
+	stmt, err := parser.ParseStatement()
 	if err != nil {
+		log.Printf("Failed to parse query: %v", err)
 		return ftQuery, stQuery, tableName, nil
 	}
 
 	// Collect all table names from the AST
-	tables := collectTableNames(expr)
+	tables := collectTableNames(stmt)
+
+	// Map to hold table name replacements
+	replacements := make(map[string]string)
 
 	for _, tbl := range tables {
-		tableName = tbl.Name.Name
+		originalTableName := tbl.Name.Name
+		tableName = strings.ToLower(originalTableName)
 		config, ok := s.configs[tableName]
 		if !ok {
 			continue
 		}
 
 		// Extract sharding key value
-		var value interface{}
-		var id int64
-		var keyFound bool
-		value, id, keyFound, err = s.extractShardingKeyValue(config.ShardingKey, tableName, expr, args...)
+		value, keyFound, err := extractShardingKeyValue(config.ShardingKey, tableName, stmt, args)
 		if err != nil {
-			return
+			log.Printf("Error extracting sharding key: %v", err)
+			continue
+		}
+		if !keyFound {
+			err = ErrMissingShardingKey
+			log.Printf("Sharding key not found: %v", err)
+			continue
 		}
 
 		// Compute table suffix
-		var suffix string
-		suffix, err = getSuffix(value, id, keyFound, config)
+		suffix, err := config.ShardingAlgorithm(value)
 		if err != nil {
-			return
+			log.Printf("Error computing table suffix: %v", err)
+			continue
 		}
 
-		newTableName := tableName + suffix
-
-		// Replace table names in the AST
-		replacer := &tableNameReplacer{
-			oldName: tableName,
-			newName: newTableName,
-		}
-		sqlparser.Walk(replacer, expr)
+		newTableName := originalTableName + suffix
+		replacements[originalTableName] = newTableName
 	}
 
+	// Replace table names in the AST
+	replaceTableNames(stmt, replacements)
+
 	// Convert the modified AST back into a query string
-	stQuery = expr.String()
+	stQuery = stmt.String()
+
+	// Log the original and modified queries
+	log.Printf("Original Query: %s", ftQuery)
+	log.Printf("Modified Query: %s", stQuery)
+
 	return
 }
 
-type tableNameReplacer struct {
-	oldName string
-	newName string
-}
+// Replace table names in the AST
+func replaceTableNames(stmt sqlparser.Statement, replacements map[string]string) {
+	// Get the root source from the statement
+	source := sqlparser.StatementSource(stmt)
+	if source != nil {
+		sqlparser.ForEachSource(source, func(s sqlparser.Source) bool {
+			if table, ok := s.(*sqlparser.TableName); ok {
+				oldName := table.Name.Name
+				if newName, exists := replacements[oldName]; exists {
+					// Replace the table name
+					table.Name.Name = newName
+				}
+			}
+			return true
+		})
+	}
 
-func (v *tableNameReplacer) Visit(node sqlparser.Node) (w sqlparser.Visitor, err error) {
-	// Continue traversal
-	return v, nil
-}
-
-func (v *tableNameReplacer) VisitEnd(node sqlparser.Node) error {
-	switch n := node.(type) {
-	case *sqlparser.TableName:
-		if n.Name.Name == v.oldName {
-			n.Name.Name = v.newName
+	// If the statement is an UPDATE or DELETE, we might need to replace the table name in the statement itself
+	switch stmt := stmt.(type) {
+	case *sqlparser.UpdateStatement:
+		oldName := stmt.TableName.Name.Name
+		if newName, exists := replacements[oldName]; exists {
+			stmt.TableName.Name.Name = newName
 		}
-	case *sqlparser.QualifiedRef:
-		if n.Table != nil && n.Table.Name == v.oldName {
-			n.Table.Name = v.newName
+	case *sqlparser.DeleteStatement:
+		oldName := stmt.TableName.Name.Name
+		if newName, exists := replacements[oldName]; exists {
+			stmt.TableName.Name.Name = newName
+		}
+	case *sqlparser.InsertStatement:
+		oldName := stmt.TableName.Name.Name
+		if newName, exists := replacements[oldName]; exists {
+			stmt.TableName.Name.Name = newName
 		}
 	}
-	return nil
+
+}
+
+// Extract sharding key value from the WHERE clause
+func extractShardingKeyValue(key string, tableName string, stmt sqlparser.Statement, args []interface{}) (value interface{}, keyFound bool, err error) {
+	var extractor shardingKeyExtractor
+
+	// Set up the extractor
+	extractor.key = key
+	extractor.tableName = tableName
+	extractor.args = args
+
+	// Get the WHERE clause expression
+	var whereExpr sqlparser.Expr
+	switch stmt := stmt.(type) {
+	case *sqlparser.SelectStatement:
+		whereExpr = stmt.Condition
+	case *sqlparser.UpdateStatement:
+		whereExpr = stmt.Condition
+	case *sqlparser.DeleteStatement:
+		whereExpr = stmt.Condition
+	default:
+		return nil, false, nil
+	}
+
+	if whereExpr == nil {
+		return nil, false, nil
+	}
+
+	// Walk the expressions
+	err = sqlparser.Walk(&extractor, whereExpr)
+	if err != nil {
+		return nil, false, err
+	}
+	if extractor.err != nil {
+		return nil, false, extractor.err
+	}
+	if !extractor.keyFound {
+		return nil, false, nil
+	}
+	return extractor.value, true, nil
 }
 
 type shardingKeyExtractor struct {
@@ -413,12 +505,12 @@ type shardingKeyExtractor struct {
 	tableName string
 	args      []interface{}
 	value     interface{}
-	id        int64
 	keyFound  bool
 	err       error
 }
 
 func (v *shardingKeyExtractor) Visit(node sqlparser.Node) (w sqlparser.Visitor, err error) {
+	// Continue traversing the AST
 	return v, nil
 }
 
@@ -430,13 +522,14 @@ func (v *shardingKeyExtractor) VisitEnd(node sqlparser.Node) error {
 			// Handle left side of the expression
 			switch col := n.X.(type) {
 			case *sqlparser.QualifiedRef:
-				colTable = col.Table.Name
-				colName = col.Column.Name
+				colTable = sqlparser.IdentName(col.Table)
+				colName = sqlparser.IdentName(col.Column)
 			case *sqlparser.Ident:
 				colName = col.Name
 			default:
 				return nil
 			}
+
 			if colName == v.key && (v.tableName == "" || colTable == v.tableName) {
 				// Extract value from the right side
 				switch val := n.Y.(type) {
@@ -444,47 +537,23 @@ func (v *shardingKeyExtractor) VisitEnd(node sqlparser.Node) error {
 					if val.Pos < len(v.args) {
 						v.value = v.args[val.Pos]
 						v.keyFound = true
-						return io.EOF // Stop traversal
 					} else {
 						v.err = fmt.Errorf("argument index out of range")
-						return io.EOF
+						return v.err
 					}
 				case *sqlparser.NumberLit:
-					v.value, _ = strconv.ParseInt(val.Value, 10, 64)
+					v.value = val.Value
 					v.keyFound = true
-					return io.EOF // Stop traversal
 				case *sqlparser.StringLit:
 					v.value = val.Value
 					v.keyFound = true
-					return io.EOF // Stop traversal
 				default:
 					// Unsupported value type
-					return nil
 				}
 			}
 		}
 	}
 	return nil
-}
-
-func (s *Sharding) extractShardingKeyValue(key string, tableName string, stmt sqlparser.Statement, args ...interface{}) (value interface{}, id int64, keyFound bool, err error) {
-	extractor := &shardingKeyExtractor{
-		key:       key,
-		tableName: tableName,
-		args:      args,
-	}
-	// Walk the AST
-	err = sqlparser.Walk(extractor, stmt)
-	if err != nil && err != io.EOF {
-		return nil, 0, false, err
-	}
-	if extractor.err != nil {
-		return nil, 0, false, extractor.err
-	}
-	if !extractor.keyFound {
-		return nil, 0, false, ErrMissingShardingKey
-	}
-	return extractor.value, extractor.id, true, nil
 }
 
 func getSuffix(value interface{}, id int64, keyFound bool, r Config) (suffix string, err error) {
