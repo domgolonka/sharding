@@ -302,13 +302,14 @@ func (s *Sharding) switchConn(db *gorm.DB) {
 	// information by table name during the migration.
 	if _, ok := db.Get(ShardingIgnoreStoreKey); !ok {
 		s.mutex.Lock()
+		defer s.mutex.Unlock()
 		if db.Statement.ConnPool != nil {
-			if _, ok := s.configs[db.Statement.Table]; ok {
+			if _, ok := s.configs[strings.ToLower(db.Statement.Table)]; ok {
 				// Only set ConnPool for sharded tables
 				db.Statement.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
+				fmt.Printf("ConnPool replaced for table: %s\n", db.Statement.Table)
 			}
 		}
-		s.mutex.Unlock()
 	}
 
 }
@@ -356,11 +357,11 @@ func collectTableNames(stmt sqlparser.Statement) []*sqlparser.TableName {
 	return tables
 }
 
-// Inside the resolve function
 func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery, tableName string, err error) {
 	ftQuery = query
 	stQuery = query
 	if len(s.configs) == 0 {
+		log.Println("No sharding configurations available.")
 		return
 	}
 
@@ -368,45 +369,58 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 	parser := sqlparser.NewParser(strings.NewReader(query))
 	stmt, err := parser.ParseStatement()
 	if err != nil {
-		log.Printf("Failed to parse query: %v", err)
+		log.Printf("Failed to parse query: %v\n", err)
 		return ftQuery, stQuery, tableName, nil
 	}
 
 	// Collect all table names from the AST
 	tables := collectTableNames(stmt)
+	log.Printf("Tables found in query: %v\n", tables)
 
 	// Map to hold table name replacements
 	replacements := make(map[string]string)
+
+	// Declare variables outside the loop to prevent shadowing
+	var value interface{}
+	var keyFound bool
+	var suffix string
 
 	for _, tbl := range tables {
 		originalTableName := tbl.Name.Name
 		tableName = strings.ToLower(originalTableName)
 		config, ok := s.configs[tableName]
 		if !ok {
+			log.Printf("No sharding config for table: %s\n", tableName)
 			continue
 		}
 
 		// Extract sharding key value
-		value, keyFound, err := extractShardingKeyValue(config.ShardingKey, tableName, stmt, args)
+		value, keyFound, err = extractShardingKeyValue(config.ShardingKey, tableName, stmt, args)
 		if err != nil {
-			log.Printf("Error extracting sharding key: %v", err)
-			continue
+			log.Printf("Error extracting sharding key for table %s: %v\n", tableName, err)
+			return
 		}
 		if !keyFound {
 			err = ErrMissingShardingKey
-			log.Printf("Sharding key not found: %v", err)
-			continue
+			log.Printf("Sharding key not found for table: %s\n", tableName)
+			return
 		}
 
 		// Compute table suffix
-		suffix, err := config.ShardingAlgorithm(value)
+		suffix, err = config.ShardingAlgorithm(value)
 		if err != nil {
-			log.Printf("Error computing table suffix: %v", err)
-			continue
+			log.Printf("Error computing table suffix for table %s: %v\n", tableName, err)
+			return
 		}
 
 		newTableName := originalTableName + suffix
 		replacements[originalTableName] = newTableName
+		log.Printf("Table %s replaced with %s\n", originalTableName, newTableName)
+	}
+
+	if len(replacements) == 0 {
+		log.Printf("No table names to replace in query: %s\n", query)
+		return
 	}
 
 	// Replace table names in the AST
@@ -416,15 +430,15 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 	stQuery = stmt.String()
 
 	// Log the original and modified queries
-	log.Printf("Original Query: %s", ftQuery)
-	log.Printf("Modified Query: %s", stQuery)
+	log.Printf("Original Query: %s\n", ftQuery)
+	log.Printf("Modified Query: %s\n", stQuery)
 
 	return
 }
 
 // Replace table names in the AST
 func replaceTableNames(stmt sqlparser.Statement, replacements map[string]string) {
-	// Get the root source from the statement
+	// Replace table names in FROM and JOIN clauses
 	source := sqlparser.StatementSource(stmt)
 	if source != nil {
 		sqlparser.ForEachSource(source, func(s sqlparser.Source) bool {
@@ -439,7 +453,7 @@ func replaceTableNames(stmt sqlparser.Statement, replacements map[string]string)
 		})
 	}
 
-	// If the statement is an UPDATE or DELETE, we might need to replace the table name in the statement itself
+	// Replace table name in main table for Update/Delete/Insert statements
 	switch stmt := stmt.(type) {
 	case *sqlparser.UpdateStatement:
 		oldName := stmt.TableName.Name.Name
@@ -457,7 +471,6 @@ func replaceTableNames(stmt sqlparser.Statement, replacements map[string]string)
 			stmt.TableName.Name.Name = newName
 		}
 	}
-
 }
 
 // Extract sharding key value from the WHERE clause
@@ -542,7 +555,13 @@ func (v *shardingKeyExtractor) VisitEnd(node sqlparser.Node) error {
 						return v.err
 					}
 				case *sqlparser.NumberLit:
-					v.value = val.Value
+					// Convert number string to appropriate type
+					id, convErr := strconv.ParseInt(val.Value, 10, 64)
+					if convErr != nil {
+						v.err = convErr
+						return v.err
+					}
+					v.value = id
 					v.keyFound = true
 				case *sqlparser.StringLit:
 					v.value = val.Value
