@@ -4,13 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/longbridgeapp/sqlparser"
+	"golang.org/x/exp/slices"
 	"gorm.io/gorm"
 )
 
@@ -61,7 +61,7 @@ type Config struct {
 	//			return fmt.Sprintf("_%02d", user_id % 64), nil
 	//		}
 	//		return "", errors.New("invalid user_id")
-	//	}
+	// 	}
 	ShardingAlgorithm func(columnValue any) (suffix string, err error)
 
 	// ShardingSuffixs specifies a function to generate all table's suffix.
@@ -116,11 +116,11 @@ func (s *Sharding) compile() error {
 	}
 	for _, table := range s._tables {
 		if t, ok := table.(string); ok {
-			s.configs[strings.ToLower(t)] = s._config
+			s.configs[t] = s._config
 		} else {
 			stmt := &gorm.Statement{DB: s.DB}
 			if err := stmt.Parse(table); err == nil {
-				s.configs[strings.ToLower(stmt.Table)] = s._config
+				s.configs[stmt.Table] = s._config
 			} else {
 				return err
 			}
@@ -129,7 +129,7 @@ func (s *Sharding) compile() error {
 
 	for t, c := range s.configs {
 		if c.NumberOfShards > 1024 && c.PrimaryKeyGenerator == PKSnowflake {
-			panic("Snowflake NumberOfShards should be less than 1024")
+			panic("Snowflake NumberOfShards should less than 1024")
 		}
 
 		if c.PrimaryKeyGenerator == PKSnowflake {
@@ -156,7 +156,7 @@ func (s *Sharding) compile() error {
 			}
 		} else if c.PrimaryKeyGenerator == PKCustom {
 			if c.PrimaryKeyGeneratorFn == nil {
-				return errors.New("PrimaryKeyGeneratorFn is required when using PKCustom")
+				return errors.New("PrimaryKeyGeneratorFn is required when use PKCustom")
 			}
 		} else {
 			return errors.New("PrimaryKeyGenerator can only be one of PKSnowflake, PKPGSequence, PKMySQLSequence and PKCustom")
@@ -188,8 +188,8 @@ func (s *Sharding) compile() error {
 						id = int(crc32.ChecksumIEEE([]byte(value)))
 					}
 				default:
-					return "", fmt.Errorf("default algorithm only supports integer and string columns, " +
-						"if you use other types, specify your own ShardingAlgorithm")
+					return "", fmt.Errorf("default algorithm only support integer and string column," +
+						"if you use other type, specify you own ShardingAlgorithm")
 				}
 
 				return fmt.Sprintf(c.tableFormat, id%int(c.NumberOfShards)), nil
@@ -238,15 +238,8 @@ func (s *Sharding) LastQuery() string {
 
 // Initialize implement for Gorm plugin interface
 func (s *Sharding) Initialize(db *gorm.DB) error {
-	fmt.Println("Sharding plugin initialized")
-	s.DB = db
-
-	// First, compile the configurations
-	if err := s.compile(); err != nil {
-		return err
-	}
-
 	db.Dialector = NewShardingDialector(db.Dialector, s)
+	s.DB = db
 	s.registerCallbacks(db)
 
 	for t, c := range s.configs {
@@ -277,7 +270,7 @@ func (s *Sharding) Initialize(db *gorm.DB) error {
 		s.snowflakeNodes[i] = n
 	}
 
-	return nil
+	return s.compile()
 }
 
 func (s *Sharding) registerCallbacks(db *gorm.DB) {
@@ -290,383 +283,185 @@ func (s *Sharding) registerCallbacks(db *gorm.DB) {
 }
 
 func (s *Sharding) switchConn(db *gorm.DB) {
-	fmt.Println("Sharding switchConn called")
-
-	//// Skip sharding for GORM's internal queries
-	//if db.Statement == nil || db.Statement.SQL.String() == "" {
-	//	return
-	//}
-
 	// Support ignore sharding in some case, like:
 	// When DoubleWrite is enabled, we need to query database schema
 	// information by table name during the migration.
 	if _, ok := db.Get(ShardingIgnoreStoreKey); !ok {
 		s.mutex.Lock()
-		defer s.mutex.Unlock()
 		if db.Statement.ConnPool != nil {
-			if _, ok := s.configs[strings.ToLower(db.Statement.Table)]; ok {
-				// Only set ConnPool for sharded tables
-				db.Statement.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
-				fmt.Printf("ConnPool replaced for table: %s\n", db.Statement.Table)
-			}
+			s.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
+			db.Statement.ConnPool = s.ConnPool
 		}
+		s.mutex.Unlock()
 	}
 }
 
-type tableNameCollector struct {
-	tables []*sqlparser.TableName
-}
-
-func (v *tableNameCollector) Visit(node sqlparser.Node) (w sqlparser.Visitor, err error) {
-	// Continue traversal
-	return v, nil
-}
-
-func (v *tableNameCollector) VisitEnd(node sqlparser.Node) error {
-	switch n := node.(type) {
-	case *sqlparser.TableName:
-		v.tables = append(v.tables, n)
-	}
-	return nil
-}
-
-// Collect all table names from the AST
-func collectTableNames(stmt sqlparser.Statement) []*sqlparser.TableName {
-
-	// Create a collector
-	collector := &tableNameCollector{}
-
-	// Walk the AST
-	sqlparser.Walk(collector, stmt)
-
-	return collector.tables
-}
-
-// resolve parses and modifies the query based on sharding configurations.
-func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery, tableName string, err error) {
+// resolve split the old query to full table query and sharding table query
+func (s *Sharding) resolve(query string, args ...any) (ftQuery, stQuery, tableName string, err error) {
 	ftQuery = query
 	stQuery = query
 	if len(s.configs) == 0 {
-		log.Println("No sharding configurations available.")
 		return
 	}
 
-	// Parse the SQL query into an AST
-	parser := sqlparser.NewParser(strings.NewReader(query))
-	stmt, err := parser.ParseStatement()
+	expr, err := sqlparser.NewParser(strings.NewReader(query)).ParseStatement()
 	if err != nil {
-		log.Printf("Failed to parse query: %v\n", err)
 		return ftQuery, stQuery, tableName, nil
 	}
 
-	// Collect all table names from the AST
-	tables := collectTableNames(stmt)
-	log.Printf("Tables found in query: %v\n", tables)
+	var table *sqlparser.TableName
+	var condition sqlparser.Expr
+	var isInsert bool
+	var insertNames []*sqlparser.Ident
+	var insertExpressions []*sqlparser.Exprs
+	var insertStmt *sqlparser.InsertStatement
 
-	// Map to hold table name replacements
-	replacements := make(map[string]string)
-
-	// Variables to hold sharding details
-	var value interface{}
-	var keyFound bool
-	var suffix string
-
-	for _, tbl := range tables {
-		originalTableName := tbl.Name.Name
-		tableNameLower := strings.ToLower(originalTableName)
-		config, ok := s.configs[tableNameLower]
+	switch stmt := expr.(type) {
+	case *sqlparser.SelectStatement:
+		tbl, ok := stmt.FromItems.(*sqlparser.TableName)
 		if !ok {
-			log.Printf("No sharding config for table: %s\n", tableNameLower)
-			continue
-		}
-
-		// Extract sharding key value
-		value, keyFound, err = extractShardingKeyValue(config.ShardingKey, tableNameLower, stmt, args)
-		if err != nil {
-			log.Printf("Error extracting sharding key for table %s: %v\n", tableNameLower, err)
 			return
 		}
-		if !keyFound {
-			err = ErrMissingShardingKey
-			log.Printf("Sharding key not found for table: %s\n", tableNameLower)
+		if stmt.Hint != nil && stmt.Hint.Value == "nosharding" {
 			return
 		}
-
-		// Compute table suffix
-		suffix, err = config.ShardingAlgorithm(value)
-		if err != nil {
-			log.Printf("Error computing table suffix for table %s: %v\n", tableNameLower, err)
-			return
-		}
-
-		newTableName := originalTableName + suffix
-		replacements[originalTableName] = newTableName
-		log.Printf("Table %s replaced with %s\n", originalTableName, newTableName)
+		table = tbl
+		condition = stmt.Condition
+	case *sqlparser.InsertStatement:
+		table = stmt.TableName
+		isInsert = true
+		insertNames = stmt.ColumnNames
+		insertExpressions = stmt.Expressions
+		insertStmt = stmt
+	case *sqlparser.UpdateStatement:
+		condition = stmt.Condition
+		table = stmt.TableName
+	case *sqlparser.DeleteStatement:
+		condition = stmt.Condition
+		table = stmt.TableName
+	default:
+		return ftQuery, stQuery, "", sqlparser.ErrNotImplemented
 	}
 
-	if len(replacements) == 0 {
-		log.Printf("No table names to replace in query: %s\n", query)
+	tableName = table.Name.Name
+	r, ok := s.configs[tableName]
+	if !ok {
 		return
 	}
 
-	// Replace table names in the AST
-	replaceTableNames(stmt, replacements)
+	var suffix string
+	if isInsert {
+		var newTable *sqlparser.TableName
+		for _, insertExpression := range insertExpressions {
+			var value any
+			var id int64
+			var keyFind bool
+			columnNames := insertNames
+			insertValues := insertExpression.Exprs
+			value, id, keyFind, err = s.insertValue(r.ShardingKey, insertNames, insertValues, args...)
+			if err != nil {
+				return
+			}
 
-	// Convert the modified AST back into a query string
-	stQuery = stmt.String()
+			var subSuffix string
+			subSuffix, err = getSuffix(value, id, keyFind, r)
+			if err != nil {
+				return
+			}
 
-	// Log the original and modified queries
-	log.Printf("Original Query: %s\n", ftQuery)
-	log.Printf("Modified Query: %s\n", stQuery)
+			if suffix != "" && suffix != subSuffix {
+				err = ErrInsertDiffSuffix
+				return
+			}
+
+			suffix = subSuffix
+
+			newTable = &sqlparser.TableName{Name: &sqlparser.Ident{Name: tableName + suffix}}
+
+			fillID := true
+			if isInsert {
+				for _, name := range insertNames {
+					if name.Name == "id" {
+						fillID = false
+						break
+					}
+				}
+				suffixWord := strings.Replace(suffix, "_", "", 1)
+				tblIdx, err := strconv.Atoi(suffixWord)
+				if err != nil {
+					tblIdx = slices.Index(r.ShardingSuffixs(), suffix)
+					if tblIdx == -1 {
+						return ftQuery, stQuery, tableName, errors.New("table suffix '" + suffix + "' is not in ShardingSuffixs. In order to generate the primary key, ShardingSuffixs should include all table suffixes")
+					}
+					//return ftQuery, stQuery, tableName, err
+				}
+
+				id := r.PrimaryKeyGeneratorFn(int64(tblIdx))
+				if id == 0 {
+					fillID = false
+				}
+
+				if fillID {
+					columnNames = append(insertNames, &sqlparser.Ident{Name: "id"})
+					insertValues = append(insertValues, &sqlparser.NumberLit{Value: strconv.FormatInt(id, 10)})
+				}
+			}
+
+			if fillID {
+				insertStmt.ColumnNames = columnNames
+				insertExpression.Exprs = insertValues
+			}
+		}
+
+		ftQuery = insertStmt.String()
+		insertStmt.TableName = newTable
+		stQuery = insertStmt.String()
+
+	} else {
+		var value any
+		var id int64
+		var keyFind bool
+		value, id, keyFind, err = s.nonInsertValue(r.ShardingKey, condition, args...)
+		if err != nil {
+			return
+		}
+
+		suffix, err = getSuffix(value, id, keyFind, r)
+		if err != nil {
+			return
+		}
+
+		newTable := &sqlparser.TableName{Name: &sqlparser.Ident{Name: tableName + suffix}}
+
+		switch stmt := expr.(type) {
+		case *sqlparser.SelectStatement:
+			ftQuery = stmt.String()
+			stmt.FromItems = newTable
+			stmt.OrderBy = replaceOrderByTableName(stmt.OrderBy, tableName, newTable.Name.Name)
+			stQuery = stmt.String()
+		case *sqlparser.UpdateStatement:
+			ftQuery = stmt.String()
+			stmt.TableName = newTable
+			stQuery = stmt.String()
+		case *sqlparser.DeleteStatement:
+			ftQuery = stmt.String()
+			stmt.TableName = newTable
+			stQuery = stmt.String()
+		}
+	}
 
 	return
 }
 
-// replaceTableNames replaces table names in the AST, including qualified references.
-func replaceTableNames(stmt sqlparser.Statement, replacements map[string]string) {
-	// Replace table names in FROM and JOIN clauses
-	source := sqlparser.StatementSource(stmt)
-	if source != nil {
-		sqlparser.ForEachSource(source, func(s sqlparser.Source) bool {
-			if table, ok := s.(*sqlparser.TableName); ok {
-				oldName := table.Name.Name
-				if newName, exists := replacements[oldName]; exists {
-					// Replace the table name
-					table.Name.Name = newName
-					log.Printf("Replaced table name from %s to %s\n", oldName, newName)
-				}
-			}
-			return true
-		})
-	}
-
-	// Replace table name in main table for Update/Delete/Insert statements
-	switch stmt := stmt.(type) {
-	case *sqlparser.UpdateStatement:
-		oldName := stmt.TableName.Name.Name
-		if newName, exists := replacements[oldName]; exists {
-			stmt.TableName.Name.Name = newName
-			log.Printf("Replaced main table name from %s to %s\n", oldName, newName)
-		}
-	case *sqlparser.DeleteStatement:
-		oldName := stmt.TableName.Name.Name
-		if newName, exists := replacements[oldName]; exists {
-			stmt.TableName.Name.Name = newName
-			log.Printf("Replaced main table name from %s to %s\n", oldName, newName)
-		}
-	case *sqlparser.InsertStatement:
-		oldName := stmt.TableName.Name.Name
-		if newName, exists := replacements[oldName]; exists {
-			stmt.TableName.Name.Name = newName
-			log.Printf("Replaced main table name from %s to %s\n", oldName, newName)
-		}
-	}
-
-	// Traverse the entire AST to replace QualifiedRefs
-	sqlparser.Walk(&tableNameReplacer{
-		replacements: replacements,
-	}, stmt)
-}
-
-// tableNameReplacer traverses the AST and replaces QualifiedRefs based on the replacements map.
-type tableNameReplacer struct {
-	replacements map[string]string
-}
-
-func (r *tableNameReplacer) Visit(node sqlparser.Node) (sqlparser.Visitor, error) {
-	switch n := node.(type) {
-	case *sqlparser.QualifiedRef:
-		oldTable := n.Table.Name
-		if newTable, exists := r.replacements[oldTable]; exists {
-			log.Printf("Replacing table reference '%s' with '%s'\n", oldTable, newTable)
-			n.Table = &sqlparser.Ident{Name: newTable}
-		}
-	}
-	return r, nil
-}
-
-func (r *tableNameReplacer) VisitEnd(node sqlparser.Node) error {
-	return nil
-}
-
-// extractShardingKeyValue extracts the sharding key value from the statement
-func extractShardingKeyValue(key string, tableName string, stmt sqlparser.Statement, args []interface{}) (interface{}, bool, error) {
-	switch s := stmt.(type) {
-	case *sqlparser.SelectStatement, *sqlparser.UpdateStatement, *sqlparser.DeleteStatement:
-		var whereExpr sqlparser.Expr
-		switch stmt := s.(type) {
-		case *sqlparser.SelectStatement:
-			whereExpr = stmt.Condition
-		case *sqlparser.UpdateStatement:
-			whereExpr = stmt.Condition
-		case *sqlparser.DeleteStatement:
-			whereExpr = stmt.Condition
-		}
-
-		if whereExpr == nil {
-			return nil, false, ErrMissingShardingKey
-		}
-
-		extractor := &shardingKeyExtractor{
-			key:       key,
-			tableName: tableName,
-			args:      args,
-		}
-
-		err := sqlparser.Walk(extractor, whereExpr)
-		if err != nil {
-			return nil, false, err
-		}
-		if extractor.err != nil {
-			return nil, false, extractor.err
-		}
-		if !extractor.keyFound {
-			return nil, false, ErrMissingShardingKey
-		}
-		return extractor.value, true, nil
-
-	case *sqlparser.InsertStatement:
-		if len(s.ColumnNames) == 0 || len(s.Expressions) == 0 {
-			return nil, false, ErrMissingShardingKey
-		}
-
-		// Find the index of the sharding key in ColumnNames
-		var shardingKeyIndex = -1
-		for i, col := range s.ColumnNames {
-			if strings.ToLower(col.Name) == strings.ToLower(key) {
-				shardingKeyIndex = i
-				break
-			}
-		}
-
-		if shardingKeyIndex == -1 {
-			return nil, false, ErrMissingShardingKey
-		}
-
-		var shardValue interface{}
-		keyFound := false
-
-		for _, exprs := range s.Expressions {
-			if shardingKeyIndex >= len(exprs.Exprs) {
-				return nil, false, ErrMissingShardingKey
-			}
-
-			expr := exprs.Exprs[shardingKeyIndex]
-
-			var currentValue interface{}
-			switch v := expr.(type) {
-			case *sqlparser.BindExpr:
-				if v.Pos < len(args) {
-					currentValue = args[v.Pos]
-				} else {
-					return nil, false, fmt.Errorf("argument index out of range")
-				}
-			case *sqlparser.StringLit:
-				currentValue = v.Value
-			case *sqlparser.NumberLit:
-				parsed, err := strconv.ParseInt(v.Value, 10, 64)
-				if err != nil {
-					return nil, false, err
-				}
-				currentValue = parsed
-			default:
-				return nil, false, fmt.Errorf("unsupported sharding key expression type")
-			}
-
-			if !keyFound {
-				shardValue = currentValue
-				keyFound = true
-			} else {
-				// Ensure all sharding key values are the same
-				if shardValue != currentValue {
-					return nil, false, ErrInsertDiffSuffix
-				}
-			}
-		}
-
-		if !keyFound {
-			return nil, false, ErrMissingShardingKey
-		}
-
-		return shardValue, true, nil
-
-	default:
-		return nil, false, ErrMissingShardingKey
-	}
-}
-
-type shardingKeyExtractor struct {
-	key       string
-	tableName string
-	args      []interface{}
-	value     interface{}
-	keyFound  bool
-	err       error
-}
-
-func (v *shardingKeyExtractor) Visit(node sqlparser.Node) (sqlparser.Visitor, error) {
-	// Continue traversing the AST
-	return v, nil
-}
-
-func (v *shardingKeyExtractor) VisitEnd(node sqlparser.Node) error {
-	switch n := node.(type) {
-	case *sqlparser.BinaryExpr:
-		if n.Op == sqlparser.EQ { // Only handle '=' operator
-			var colName, colTable string
-			// Handle left side of the expression
-			switch col := n.X.(type) {
-			case *sqlparser.QualifiedRef:
-				colTable = sqlparser.IdentName(col.Table)
-				colName = sqlparser.IdentName(col.Column)
-			case *sqlparser.Ident:
-				colName = col.Name
-			default:
-				return nil
-			}
-
-			if strings.ToLower(colName) == strings.ToLower(v.key) &&
-				(strings.ToLower(colTable) == strings.ToLower(v.tableName) || v.tableName == "") {
-				// Extract value from the right side
-				switch val := n.Y.(type) {
-				case *sqlparser.BindExpr:
-					if val.Pos < len(v.args) {
-						v.value = v.args[val.Pos]
-						v.keyFound = true
-					} else {
-						v.err = fmt.Errorf("argument index out of range")
-						return v.err
-					}
-				case *sqlparser.NumberLit:
-					// Convert number string to appropriate type
-					id, convErr := strconv.ParseInt(val.Value, 10, 64)
-					if convErr != nil {
-						v.err = convErr
-						return v.err
-					}
-					v.value = id
-					v.keyFound = true
-				case *sqlparser.StringLit:
-					v.value = val.Value
-					v.keyFound = true
-				default:
-					// Unsupported value type
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func getSuffix(value interface{}, id int64, keyFound bool, r Config) (suffix string, err error) {
-	if keyFound {
+func getSuffix(value any, id int64, keyFind bool, r Config) (suffix string, err error) {
+	if keyFind {
 		suffix, err = r.ShardingAlgorithm(value)
 		if err != nil {
 			return
 		}
 	} else {
 		if r.ShardingAlgorithmByPrimaryKey == nil {
-			err = fmt.Errorf("no sharding key and ShardingAlgorithmByPrimaryKey is not configured")
+			err = fmt.Errorf("there is not sharding key and ShardingAlgorithmByPrimaryKey is not configured")
 			return
 		}
 		suffix = r.ShardingAlgorithmByPrimaryKey(id)
@@ -680,7 +475,7 @@ func (s *Sharding) insertValue(key string, names []*sqlparser.Ident, exprs []sql
 	}
 
 	for i, name := range names {
-		if strings.ToLower(name.Name) == strings.ToLower(key) {
+		if name.Name == key {
 			switch expr := exprs[i].(type) {
 			case *sqlparser.BindExpr:
 				value = args[expr.Pos]
@@ -700,4 +495,74 @@ func (s *Sharding) insertValue(key string, names []*sqlparser.Ident, exprs []sql
 	}
 
 	return
+}
+
+func (s *Sharding) nonInsertValue(key string, condition sqlparser.Expr, args ...any) (value any, id int64, keyFind bool, err error) {
+	err = sqlparser.Walk(sqlparser.VisitFunc(func(node sqlparser.Node) error {
+		if n, ok := node.(*sqlparser.BinaryExpr); ok {
+			x, ok := n.X.(*sqlparser.Ident)
+			if !ok {
+				if q, ok2 := n.X.(*sqlparser.QualifiedRef); ok2 {
+					x = q.Column
+					ok = true
+				}
+			}
+			if ok {
+				if x.Name == key && n.Op == sqlparser.EQ {
+					keyFind = true
+					switch expr := n.Y.(type) {
+					case *sqlparser.BindExpr:
+						value = args[expr.Pos]
+					case *sqlparser.StringLit:
+						value = expr.Value
+					case *sqlparser.NumberLit:
+						value = expr.Value
+					default:
+						return sqlparser.ErrNotImplemented
+					}
+					return nil
+				} else if x.Name == "id" && n.Op == sqlparser.EQ {
+					switch expr := n.Y.(type) {
+					case *sqlparser.BindExpr:
+						v := args[expr.Pos]
+						var ok bool
+						if id, ok = v.(int64); !ok {
+							return fmt.Errorf("ID should be int64 type")
+						}
+					case *sqlparser.NumberLit:
+						id, err = strconv.ParseInt(expr.Value, 10, 64)
+						if err != nil {
+							return err
+						}
+					default:
+						return ErrInvalidID
+					}
+					return nil
+				}
+			}
+		}
+		return nil
+	}), condition)
+	if err != nil {
+		return
+	}
+
+	if !keyFind && id == 0 {
+		return nil, 0, keyFind, ErrMissingShardingKey
+	}
+
+	return
+}
+
+func replaceOrderByTableName(orderBy []*sqlparser.OrderingTerm, oldName, newName string) []*sqlparser.OrderingTerm {
+	for i, term := range orderBy {
+		if x, ok := term.X.(*sqlparser.QualifiedRef); ok {
+			if x.Table.Name == oldName {
+				x.Table.Name = newName
+				orderBy[i].X = x
+			}
+		}
+	}
+
+	return orderBy
 }
