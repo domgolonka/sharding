@@ -13,6 +13,7 @@ import (
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/longbridgeapp/assert"
+	tassert "github.com/stretchr/testify/assert"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -34,7 +35,7 @@ type Category struct {
 func dbURL() string {
 	dbURL := os.Getenv("DB_URL")
 	if len(dbURL) == 0 {
-		dbURL = "postgres://localhost:5432/sharding-test?sslmode=disable"
+		dbURL = "postgres://psql:psql@localhost:6432/sharding-test?sslmode=disable"
 		if mysqlDialector() {
 			dbURL = "root@tcp(127.0.0.1:3306)/sharding-test?charset=utf8mb4"
 		}
@@ -45,7 +46,7 @@ func dbURL() string {
 func dbNoIDURL() string {
 	dbURL := os.Getenv("DB_NOID_URL")
 	if len(dbURL) == 0 {
-		dbURL = "postgres://localhost:5432/sharding-noid-test?sslmode=disable"
+		dbURL = "postgres://psql:psql@localhost:6432/sharding-noid-test?sslmode=disable"
 		if mysqlDialector() {
 			dbURL = "root@tcp(127.0.0.1:3306)/sharding-noid-test?charset=utf8mb4"
 		}
@@ -56,7 +57,7 @@ func dbNoIDURL() string {
 func dbReadURL() string {
 	dbURL := os.Getenv("DB_READ_URL")
 	if len(dbURL) == 0 {
-		dbURL = "postgres://localhost:5432/sharding-read-test?sslmode=disable"
+		dbURL = "postgres://psql:psql@localhost:6432/sharding-read-test?sslmode=disable"
 		if mysqlDialector() {
 			dbURL = "root@tcp(127.0.0.1:3306)/sharding-read-test?charset=utf8mb4"
 		}
@@ -67,7 +68,7 @@ func dbReadURL() string {
 func dbWriteURL() string {
 	dbURL := os.Getenv("DB_WRITE_URL")
 	if len(dbURL) == 0 {
-		dbURL = "postgres://localhost:5432/sharding-write-test?sslmode=disable"
+		dbURL = "postgres://psql:psql@localhost:6432/sharding-write-test?sslmode=disable"
 		if mysqlDialector() {
 			dbURL = "root@tcp(127.0.0.1:3306)/sharding-write-test?charset=utf8mb4"
 		}
@@ -237,6 +238,9 @@ func TestFillID(t *testing.T) {
 	db.Create(&Order{UserID: 100, Product: "iPhone"})
 	expected := `INSERT INTO orders_0 ("user_id", "product", id) VALUES`
 	lastQuery := middleware.LastQuery()
+	if len(lastQuery) < len(expected) {
+		t.Fatalf("lastQuery is too short: %s", lastQuery)
+	}
 	assert.Equal(t, toDialect(expected), lastQuery[0:len(expected)])
 }
 
@@ -503,6 +507,153 @@ func TestDataRace(t *testing.T) {
 		cancel()
 		t.Fatal(err)
 	}
+}
+
+func TestJoinShardedWithNonShardedTable(t *testing.T) {
+	// Reset the last_query before the test
+	middleware.querys.Store("last_query", "")
+
+	var result struct {
+		Orders       Order
+		CategoryName string
+	}
+
+	// Perform the query
+	err := db.Table("orders").Select("orders.*, categories.name as category_name").
+		Joins("LEFT JOIN categories ON categories.id = orders.category_id").
+		Where("orders.user_id = ?", 100).
+		Scan(&result).Error
+
+	assert.NoError(t, err)
+
+	expected := `SELECT "orders_0".*, categories.name as category_name FROM "orders_0" LEFT JOIN categories ON categories.id = "orders_0".category_id WHERE "orders_0"."user_id" = $1`
+	actual := middleware.LastQuery()
+
+	assert.Equal(t, expected, actual)
+}
+
+type OrderDetail struct {
+	ID       int64 `gorm:"primarykey"`
+	OrderID  int64
+	Product  string
+	Quantity int
+}
+
+func TestJoinTwoShardedTables(t *testing.T) {
+	// Register the sharding configuration for OrderDetail
+	orderDetailConfig := shardingConfig
+	orderDetailConfig.ShardingKey = "order_id"
+	middlewareOrderDetail := Register(orderDetailConfig, &OrderDetail{})
+	db.Use(middlewareOrderDetail)
+
+	// Prepare data
+	order := Order{ID: 1, UserID: 100, Product: "iPhone"}
+	db.Create(&order)
+
+	orderDetail := OrderDetail{ID: 1, OrderID: 1, Product: "iPhone Case", Quantity: 2}
+	db.Create(&orderDetail)
+
+	// Join sharded Order with sharded OrderDetail
+	var results []struct {
+		Order
+		OrderDetailProduct  string
+		OrderDetailQuantity int
+	}
+
+	tx := db.Model(&Order{}).
+		Select("orders.*, order_details.product as order_detail_product, order_details.quantity as order_detail_quantity").
+		Joins("INNER JOIN order_details ON order_details.order_id = orders.id").
+		Where("orders.user_id = ?", 100).
+		Scan(&results)
+
+	// Expected query
+	expectedQuery := `SELECT orders_0.*, order_details_1.product as order_detail_product, order_details_1.quantity as order_detail_quantity FROM orders_0 INNER JOIN order_details_1 ON order_details_1.order_id = orders_0.id WHERE orders_0.user_id = $1`
+
+	// Assert query
+	assertQueryResult(t, expectedQuery, tx)
+
+	// Assert results
+	assert.Equal(t, 1, len(results))
+	assert.Equal(t, "iPhone", results[0].Product)
+	assert.Equal(t, "iPhone Case", results[0].OrderDetailProduct)
+	assert.Equal(t, 2, results[0].OrderDetailQuantity)
+}
+
+func TestSelfJoinShardedTable(t *testing.T) {
+	// Prepare data
+	order1 := Order{ID: 1, UserID: 100, Product: "iPhone"}
+	order2 := Order{ID: 2, UserID: 100, Product: "iPad"}
+	db.Create(&order1)
+	db.Create(&order2)
+
+	// Self-join on the sharded Order table
+	var results []struct {
+		Order
+		OtherProduct string
+	}
+
+	tx := db.Table("orders AS o1").
+		Select("o1.*, o2.product AS other_product").
+		Joins("INNER JOIN orders AS o2 ON o1.user_id = o2.user_id AND o1.id <> o2.id").
+		Where("o1.user_id = ?", 100).
+		Scan(&results)
+
+	// Expected query
+	expectedQuery := `SELECT o1.*, o2.product AS other_product FROM orders_0 AS o1 INNER JOIN orders_0 AS o2 ON o1.user_id = o2.user_id AND o1.id <> o2.id WHERE o1.user_id = $1`
+
+	// Assert query
+	assertQueryResult(t, expectedQuery, tx)
+
+	// Assert results
+	tassert.GreaterOrEqual(t, len(results), 1)
+}
+
+func TestJoinShardedTablesDifferentKeys(t *testing.T) {
+	// Adjust sharding configuration for OrderDetail
+	orderDetailConfig := shardingConfig
+	orderDetailConfig.ShardingKey = "order_id"
+	orderDetailConfig.ShardingAlgorithm = shardingConfig.ShardingAlgorithm
+	orderDetailConfig.NumberOfShards = shardingConfig.NumberOfShards
+	middlewareOrderDetail := Register(orderDetailConfig, &OrderDetail{})
+	db.Use(middlewareOrderDetail)
+
+	// Prepare data
+	order := Order{ID: 1, UserID: 100, Product: "iPhone"}
+	db.Create(&order)
+
+	orderDetail := OrderDetail{ID: 1, OrderID: 1, Product: "iPhone Case", Quantity: 2}
+	db.Create(&orderDetail)
+
+	// Join sharded Order with sharded OrderDetail
+	var results []struct {
+		Order
+		OrderDetailProduct  string
+		OrderDetailQuantity int
+	}
+
+	tx := db.Model(&Order{}).
+		Select("orders.*, order_details.product as order_detail_product, order_details.quantity as order_detail_quantity").
+		Joins("INNER JOIN order_details ON order_details.order_id = orders.id").
+		Where("orders.user_id = ?", 100).
+		Scan(&results)
+
+	// Determine the expected table suffixes based on the sharding algorithm
+	orderTableSuffix, _ := shardingConfig.ShardingAlgorithm(order.UserID)
+	orderDetailTableSuffix, _ := orderDetailConfig.ShardingAlgorithm(orderDetail.OrderID)
+
+	// Expected query with sharded table names
+	expectedQuery := fmt.Sprintf(`SELECT orders%s.*, order_details%s.product as order_detail_product, order_details%s.quantity as order_detail_quantity FROM orders%s INNER JOIN order_details%s ON order_details%s.order_id = orders%s.id WHERE orders%s.user_id = $1`,
+		orderTableSuffix, orderDetailTableSuffix, orderDetailTableSuffix,
+		orderTableSuffix, orderDetailTableSuffix, orderDetailTableSuffix, orderTableSuffix, orderTableSuffix)
+
+	// Assert query
+	assertQueryResult(t, expectedQuery, tx)
+
+	// Assert results
+	assert.Equal(t, 1, len(results))
+	assert.Equal(t, "iPhone", results[0].Product)
+	assert.Equal(t, "iPhone Case", results[0].OrderDetailProduct)
+	assert.Equal(t, 2, results[0].OrderDetailQuantity)
 }
 
 func assertQueryResult(t *testing.T, expected string, tx *gorm.DB) {
