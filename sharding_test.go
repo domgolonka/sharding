@@ -568,12 +568,13 @@ func TestJoinShardedWithNonShardedTable(t *testing.T) {
 	middleware.querys.Store("last_query", "")
 
 	var result struct {
-		Orders       Order
+		Order
 		CategoryName string
 	}
 
 	// Perform the query
-	err := db.Table("orders").Select("orders.*, categories.name as category_name").
+	err := db.Model(&Order{}).
+		Select("orders.*, categories.name as category_name").
 		Joins("LEFT JOIN categories ON categories.id = orders.category_id").
 		Where("orders.user_id = ?", 100).
 		Scan(&result).Error
