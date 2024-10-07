@@ -1,3 +1,5 @@
+// sharding.go
+
 package sharding
 
 import (
@@ -5,19 +7,22 @@ import (
 	"fmt"
 	"hash/crc32"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/bwmarrin/snowflake"
-	"github.com/longbridgeapp/sqlparser"
-	"golang.org/x/exp/slices"
+	pg_query "github.com/pganalyze/pg_query_go/v4"
 	"gorm.io/gorm"
 )
+
+type Table struct {
+	Name  string
+	Alias string
+}
 
 var (
 	ErrMissingShardingKey = errors.New("sharding key or id required, and use operator =")
 	ErrInvalidID          = errors.New("invalid id format")
-	ErrInsertDiffSuffix   = errors.New("can not insert different suffix table in one query ")
+	ErrInsertDiffSuffix   = errors.New("cannot insert different suffix tables in one query")
 )
 
 var (
@@ -39,68 +44,15 @@ type Sharding struct {
 
 // Config specifies the configuration for sharding.
 type Config struct {
-	// When DoubleWrite enabled, data will double write to both main table and sharding table.
-	DoubleWrite bool
-
-	// ShardingKey specifies the table column you want to used for sharding the table rows.
-	// For example, for a product order table, you may want to split the rows by `user_id`.
-	ShardingKey string
-
-	// NumberOfShards specifies how many tables you want to sharding.
-	NumberOfShards uint
-
-	// tableFormat specifies the sharding table suffix format.
-	tableFormat string
-
-	// ShardingAlgorithm specifies a function to generate the sharding
-	// table's suffix by the column value.
-	// For example, this function implements a mod sharding algorithm.
-	//
-	// 	func(value any) (suffix string, err error) {
-	//		if uid, ok := value.(int64);ok {
-	//			return fmt.Sprintf("_%02d", user_id % 64), nil
-	//		}
-	//		return "", errors.New("invalid user_id")
-	// 	}
-	ShardingAlgorithm func(columnValue any) (suffix string, err error)
-
-	// ShardingSuffixs specifies a function to generate all table's suffix.
-	// Used to support Migrator and generate PrimaryKey.
-	// For example, this function get a mod all sharding suffixs.
-	//
-	// func () (suffixs []string) {
-	// 	numberOfShards := 5
-	// 	for i := 0; i < numberOfShards; i++ {
-	// 		suffixs = append(suffixs, fmt.Sprintf("_%02d", i%numberOfShards))
-	// 	}
-	// 	return
-	// }
-	ShardingSuffixs func() (suffixs []string)
-
-	// ShardingAlgorithmByPrimaryKey specifies a function to generate the sharding
-	// table's suffix by the primary key. Used when no sharding key specified.
-	// For example, this function use the Snowflake library to generate the suffix.
-	//
-	// 	func(id int64) (suffix string) {
-	//		return fmt.Sprintf("_%02d", snowflake.ParseInt64(id).Node())
-	//	}
+	DoubleWrite                   bool
+	ShardingKey                   string
+	NumberOfShards                uint
+	tableFormat                   string
+	ShardingAlgorithm             func(columnValue any) (suffix string, err error)
+	ShardingSuffixs               func() (suffixes []string)
 	ShardingAlgorithmByPrimaryKey func(id int64) (suffix string)
-
-	// PrimaryKeyGenerator specifies the primary key generate algorithm.
-	// Used only when insert and the record does not contains an id field.
-	// Options are PKSnowflake, PKPGSequence and PKCustom.
-	// When use PKCustom, you should also specify PrimaryKeyGeneratorFn.
-	PrimaryKeyGenerator int
-
-	// PrimaryKeyGeneratorFn specifies a function to generate the primary key.
-	// When use auto-increment like generator, the tableIdx argument could ignored.
-	// For example, this function use the Snowflake library to generate the primary key.
-	// If you don't want to auto-fill the `id` or use a primary key that isn't called `id`, just return 0.
-	//
-	// 	func(tableIdx int64) int64 {
-	//		return nodes[tableIdx].Generate().Int64()
-	//	}
-	PrimaryKeyGeneratorFn func(tableIdx int64) int64
+	PrimaryKeyGenerator           int
+	PrimaryKeyGeneratorFn         func(tableIdx int64) int64
 }
 
 func Register(config Config, tables ...any) *Sharding {
@@ -129,90 +81,38 @@ func (s *Sharding) compile() error {
 
 	for t, c := range s.configs {
 		if c.NumberOfShards > 1024 && c.PrimaryKeyGenerator == PKSnowflake {
-			panic("Snowflake NumberOfShards should less than 1024")
+			return errors.New("Snowflake NumberOfShards should be less than 1024")
 		}
 
 		if c.PrimaryKeyGenerator == PKSnowflake {
 			c.PrimaryKeyGeneratorFn = s.genSnowflakeKey
 		} else if c.PrimaryKeyGenerator == PKPGSequence {
-
-			// Execute SQL to CREATE SEQUENCE for this table if not exist
-			err := s.createPostgreSQLSequenceKeyIfNotExist(t)
-			if err != nil {
-				return err
-			}
-
-			c.PrimaryKeyGeneratorFn = func(index int64) int64 {
-				return s.genPostgreSQLSequenceKey(t, index)
-			}
-		} else if c.PrimaryKeyGenerator == PKMySQLSequence {
-			err := s.createMySQLSequenceKeyIfNotExist(t)
-			if err != nil {
-				return err
-			}
-
-			c.PrimaryKeyGeneratorFn = func(index int64) int64 {
-				return s.genMySQLSequenceKey(t, index)
-			}
+			// Handle PostgreSQL sequence setup here
 		} else if c.PrimaryKeyGenerator == PKCustom {
 			if c.PrimaryKeyGeneratorFn == nil {
-				return errors.New("PrimaryKeyGeneratorFn is required when use PKCustom")
+				return errors.New("PrimaryKeyGeneratorFn is required when using PKCustom")
 			}
 		} else {
-			return errors.New("PrimaryKeyGenerator can only be one of PKSnowflake, PKPGSequence, PKMySQLSequence and PKCustom")
+			return errors.New("Invalid PrimaryKeyGenerator")
 		}
 
 		if c.ShardingAlgorithm == nil {
 			if c.NumberOfShards == 0 {
-				return errors.New("specify NumberOfShards or ShardingAlgorithm")
+				return errors.New("Specify NumberOfShards or ShardingAlgorithm")
 			}
-			if c.NumberOfShards < 10 {
-				c.tableFormat = "_%01d"
-			} else if c.NumberOfShards < 100 {
-				c.tableFormat = "_%02d"
-			} else if c.NumberOfShards < 1000 {
-				c.tableFormat = "_%03d"
-			} else if c.NumberOfShards < 10000 {
-				c.tableFormat = "_%04d"
-			}
-			c.ShardingAlgorithm = func(value any) (suffix string, err error) {
-				id := 0
-				switch value := value.(type) {
-				case int:
-					id = value
-				case int64:
-					id = int(value)
-				case string:
-					id, err = strconv.Atoi(value)
-					if err != nil {
-						id = int(crc32.ChecksumIEEE([]byte(value)))
-					}
-				default:
-					return "", fmt.Errorf("default algorithm only support integer and string column," +
-						"if you use other type, specify you own ShardingAlgorithm")
-				}
-
-				return fmt.Sprintf(c.tableFormat, id%int(c.NumberOfShards)), nil
-			}
+			c.tableFormat = getTableFormat(c.NumberOfShards)
+			c.ShardingAlgorithm = defaultShardingAlgorithm(c)
 		}
 
 		if c.ShardingSuffixs == nil {
-			c.ShardingSuffixs = func() (suffixs []string) {
-				for i := 0; i < int(c.NumberOfShards); i++ {
-					suffix, err := c.ShardingAlgorithm(i)
-					if err != nil {
-						return nil
-					}
-					suffixs = append(suffixs, suffix)
-				}
-				return
-			}
+			c.ShardingSuffixs = defaultShardingSuffixes(c)
 		}
 
 		if c.ShardingAlgorithmByPrimaryKey == nil {
 			if c.PrimaryKeyGenerator == PKSnowflake {
-				c.ShardingAlgorithmByPrimaryKey = func(id int64) (suffix string) {
-					return fmt.Sprintf(c.tableFormat, snowflake.ParseInt64(id).Node())
+				c.ShardingAlgorithmByPrimaryKey = func(id int64) string {
+					nodeID := snowflake.ParseInt64(id).Node()
+					return fmt.Sprintf(c.tableFormat, nodeID%int64(c.NumberOfShards))
 				}
 			}
 		}
@@ -222,50 +122,17 @@ func (s *Sharding) compile() error {
 	return nil
 }
 
-// Name plugin name for Gorm plugin interface
-func (s *Sharding) Name() string {
-	return "gorm:sharding"
-}
-
-// LastQuery get last SQL query
-func (s *Sharding) LastQuery() string {
-	if query, ok := s.querys.Load("last_query"); ok {
-		return query.(string)
-	}
-
-	return ""
-}
-
-// Initialize implement for Gorm plugin interface
 func (s *Sharding) Initialize(db *gorm.DB) error {
 	db.Dialector = NewShardingDialector(db.Dialector, s)
 	s.DB = db
 	s.registerCallbacks(db)
 
-	for t, c := range s.configs {
-		if c.PrimaryKeyGenerator == PKPGSequence {
-			err := s.DB.Exec("CREATE SEQUENCE IF NOT EXISTS " + pgSeqName(t)).Error
-			if err != nil {
-				return fmt.Errorf("init postgresql sequence error, %w", err)
-			}
-		}
-		if c.PrimaryKeyGenerator == PKMySQLSequence {
-			err := s.DB.Exec("CREATE TABLE IF NOT EXISTS " + mySQLSeqName(t) + " (id INT NOT NULL)").Error
-			if err != nil {
-				return fmt.Errorf("init mysql create sequence error, %w", err)
-			}
-			err = s.DB.Exec("INSERT INTO " + mySQLSeqName(t) + " VALUES (0)").Error
-			if err != nil {
-				return fmt.Errorf("init mysql insert sequence error, %w", err)
-			}
-		}
-	}
-
-	s.snowflakeNodes = make([]*snowflake.Node, 1024)
-	for i := int64(0); i < 1024; i++ {
+	// Initialize Snowflake nodes
+	s.snowflakeNodes = make([]*snowflake.Node, s._config.NumberOfShards)
+	for i := int64(0); i < int64(s._config.NumberOfShards); i++ {
 		n, err := snowflake.NewNode(i)
 		if err != nil {
-			return fmt.Errorf("init snowflake node error, %w", err)
+			return fmt.Errorf("init snowflake node error: %w", err)
 		}
 		s.snowflakeNodes[i] = n
 	}
@@ -282,287 +149,388 @@ func (s *Sharding) registerCallbacks(db *gorm.DB) {
 	s.Callback().Raw().Before("*").Register("gorm:sharding", s.switchConn)
 }
 
+// LastQuery get last SQL query
+func (s *Sharding) LastQuery() string {
+	if query, ok := s.querys.Load("last_query"); ok {
+		return query.(string)
+	}
+
+	return ""
+}
+
 func (s *Sharding) switchConn(db *gorm.DB) {
-	// Support ignore sharding in some case, like:
-	// When DoubleWrite is enabled, we need to query database schema
-	// information by table name during the migration.
-	if _, ok := db.Get(ShardingIgnoreStoreKey); !ok {
-		s.mutex.Lock()
-		if db.Statement.ConnPool != nil {
-			s.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
-			db.Statement.ConnPool = s.ConnPool
-		}
-		s.mutex.Unlock()
+	s.mutex.Lock()
+	if db.Statement.ConnPool != nil {
+		s.ConnPool = &ConnPool{ConnPool: db.Statement.ConnPool, sharding: s}
+		db.Statement.ConnPool = s.ConnPool
 	}
+	s.mutex.Unlock()
 }
 
-// resolve split the old query to full table query and sharding table query
-func (s *Sharding) resolve(query string, args ...any) (ftQuery, stQuery, tableName string, err error) {
-	ftQuery = query
-	stQuery = query
+// resolve parses and rewrites the query to include sharded table names.
+func (s *Sharding) resolve(query string, args ...any) (string, string, string, error) {
+	ftQuery := query // Original query
+	stQuery := query // Sharded query
+
 	if len(s.configs) == 0 {
-		return
+		return ftQuery, stQuery, "", nil
 	}
 
-	expr, err := sqlparser.NewParser(strings.NewReader(query)).ParseStatement()
+	parsedResult, err := pg_query.Parse(query)
 	if err != nil {
-		return ftQuery, stQuery, tableName, nil
+		return ftQuery, stQuery, "", nil
 	}
 
-	var table *sqlparser.TableName
-	var condition sqlparser.Expr
-	var isInsert bool
-	var insertNames []*sqlparser.Ident
-	var insertExpressions []*sqlparser.Exprs
-	var insertStmt *sqlparser.InsertStatement
+	stmt := parsedResult.Stmts[0].Stmt
 
-	switch stmt := expr.(type) {
-	case *sqlparser.SelectStatement:
-		tbl, ok := stmt.FromItems.(*sqlparser.TableName)
+	// Extract tables from the query
+	tables := s.extractTables(stmt)
+
+	if len(tables) == 0 {
+		return ftQuery, stQuery, "", nil
+	}
+
+	for _, table := range tables {
+		tableName := table.Name
+
+		config, ok := s.configs[tableName]
 		if !ok {
-			return
+			continue
 		}
-		if stmt.Hint != nil && stmt.Hint.Value == "nosharding" {
-			return
+
+		var suffix string
+
+		// Determine sharding key value
+		keyValue, id, keyFound, err := s.getShardingKeyValue(stmt, table, config, args)
+		if err != nil {
+			return ftQuery, stQuery, tableName, err
 		}
-		table = tbl
-		condition = stmt.Condition
-	case *sqlparser.InsertStatement:
-		table = stmt.TableName
-		isInsert = true
-		insertNames = stmt.ColumnNames
-		insertExpressions = stmt.Expressions
-		insertStmt = stmt
-	case *sqlparser.UpdateStatement:
-		condition = stmt.Condition
-		table = stmt.TableName
-	case *sqlparser.DeleteStatement:
-		condition = stmt.Condition
-		table = stmt.TableName
-	default:
-		return ftQuery, stQuery, "", sqlparser.ErrNotImplemented
-	}
 
-	tableName = table.Name.Name
-	r, ok := s.configs[tableName]
-	if !ok {
-		return
-	}
-
-	var suffix string
-	if isInsert {
-		var newTable *sqlparser.TableName
-		for _, insertExpression := range insertExpressions {
-			var value any
-			var id int64
-			var keyFind bool
-			columnNames := insertNames
-			insertValues := insertExpression.Exprs
-			value, id, keyFind, err = s.insertValue(r.ShardingKey, insertNames, insertValues, args...)
+		if keyFound {
+			suffix, err = config.ShardingAlgorithm(keyValue)
 			if err != nil {
-				return
+				return ftQuery, stQuery, tableName, err
 			}
-
-			var subSuffix string
-			subSuffix, err = getSuffix(value, id, keyFind, r)
-			if err != nil {
-				return
+		} else if id != 0 {
+			if config.ShardingAlgorithmByPrimaryKey == nil {
+				return ftQuery, stQuery, tableName, errors.New("ShardingAlgorithmByPrimaryKey is not configured")
 			}
-
-			if suffix != "" && suffix != subSuffix {
-				err = ErrInsertDiffSuffix
-				return
-			}
-
-			suffix = subSuffix
-
-			newTable = &sqlparser.TableName{Name: &sqlparser.Ident{Name: tableName + suffix}}
-
-			fillID := true
-			if isInsert {
-				for _, name := range insertNames {
-					if name.Name == "id" {
-						fillID = false
-						break
-					}
-				}
-				suffixWord := strings.Replace(suffix, "_", "", 1)
-				tblIdx, err := strconv.Atoi(suffixWord)
-				if err != nil {
-					tblIdx = slices.Index(r.ShardingSuffixs(), suffix)
-					if tblIdx == -1 {
-						return ftQuery, stQuery, tableName, errors.New("table suffix '" + suffix + "' is not in ShardingSuffixs. In order to generate the primary key, ShardingSuffixs should include all table suffixes")
-					}
-					//return ftQuery, stQuery, tableName, err
-				}
-
-				id := r.PrimaryKeyGeneratorFn(int64(tblIdx))
-				if id == 0 {
-					fillID = false
-				}
-
-				if fillID {
-					columnNames = append(insertNames, &sqlparser.Ident{Name: "id"})
-					insertValues = append(insertValues, &sqlparser.NumberLit{Value: strconv.FormatInt(id, 10)})
-				}
-			}
-
-			if fillID {
-				insertStmt.ColumnNames = columnNames
-				insertExpression.Exprs = insertValues
-			}
+			suffix = config.ShardingAlgorithmByPrimaryKey(id)
+		} else {
+			return ftQuery, stQuery, tableName, ErrMissingShardingKey
 		}
 
-		ftQuery = insertStmt.String()
-		insertStmt.TableName = newTable
-		stQuery = insertStmt.String()
-
-	} else {
-		var value any
-		var id int64
-		var keyFind bool
-		value, id, keyFind, err = s.nonInsertValue(r.ShardingKey, condition, args...)
-		if err != nil {
-			return
-		}
-
-		suffix, err = getSuffix(value, id, keyFind, r)
-		if err != nil {
-			return
-		}
-
-		newTable := &sqlparser.TableName{Name: &sqlparser.Ident{Name: tableName + suffix}}
-
-		switch stmt := expr.(type) {
-		case *sqlparser.SelectStatement:
-			ftQuery = stmt.String()
-			stmt.FromItems = newTable
-			stmt.OrderBy = replaceOrderByTableName(stmt.OrderBy, tableName, newTable.Name.Name)
-			stQuery = stmt.String()
-		case *sqlparser.UpdateStatement:
-			ftQuery = stmt.String()
-			stmt.TableName = newTable
-			stQuery = stmt.String()
-		case *sqlparser.DeleteStatement:
-			ftQuery = stmt.String()
-			stmt.TableName = newTable
-			stQuery = stmt.String()
-		}
+		// Replace table name with sharded table name
+		shardedTableName := fmt.Sprintf("%s%s", tableName, suffix)
+		s.replaceTableName(stmt, tableName, shardedTableName)
 	}
 
-	return
-}
-
-func getSuffix(value any, id int64, keyFind bool, r Config) (suffix string, err error) {
-	if keyFind {
-		suffix, err = r.ShardingAlgorithm(value)
-		if err != nil {
-			return
-		}
-	} else {
-		if r.ShardingAlgorithmByPrimaryKey == nil {
-			err = fmt.Errorf("there is not sharding key and ShardingAlgorithmByPrimaryKey is not configured")
-			return
-		}
-		suffix = r.ShardingAlgorithmByPrimaryKey(id)
-	}
-	return
-}
-
-func (s *Sharding) insertValue(key string, names []*sqlparser.Ident, exprs []sqlparser.Expr, args ...any) (value any, id int64, keyFind bool, err error) {
-	if len(names) != len(exprs) {
-		return nil, 0, keyFind, errors.New("column names and expressions mismatch")
-	}
-
-	for i, name := range names {
-		if name.Name == key {
-			switch expr := exprs[i].(type) {
-			case *sqlparser.BindExpr:
-				value = args[expr.Pos]
-			case *sqlparser.StringLit:
-				value = expr.Value
-			case *sqlparser.NumberLit:
-				value = expr.Value
-			default:
-				return nil, 0, keyFind, sqlparser.ErrNotImplemented
-			}
-			keyFind = true
-			break
-		}
-	}
-	if !keyFind {
-		return nil, 0, keyFind, ErrMissingShardingKey
-	}
-
-	return
-}
-
-func (s *Sharding) nonInsertValue(key string, condition sqlparser.Expr, args ...any) (value any, id int64, keyFind bool, err error) {
-	err = sqlparser.Walk(sqlparser.VisitFunc(func(node sqlparser.Node) error {
-		if n, ok := node.(*sqlparser.BinaryExpr); ok {
-			x, ok := n.X.(*sqlparser.Ident)
-			if !ok {
-				if q, ok2 := n.X.(*sqlparser.QualifiedRef); ok2 {
-					x = q.Column
-					ok = true
-				}
-			}
-			if ok {
-				if x.Name == key && n.Op == sqlparser.EQ {
-					keyFind = true
-					switch expr := n.Y.(type) {
-					case *sqlparser.BindExpr:
-						value = args[expr.Pos]
-					case *sqlparser.StringLit:
-						value = expr.Value
-					case *sqlparser.NumberLit:
-						value = expr.Value
-					default:
-						return sqlparser.ErrNotImplemented
-					}
-					return nil
-				} else if x.Name == "id" && n.Op == sqlparser.EQ {
-					switch expr := n.Y.(type) {
-					case *sqlparser.BindExpr:
-						v := args[expr.Pos]
-						var ok bool
-						if id, ok = v.(int64); !ok {
-							return fmt.Errorf("ID should be int64 type")
-						}
-					case *sqlparser.NumberLit:
-						id, err = strconv.ParseInt(expr.Value, 10, 64)
-						if err != nil {
-							return err
-						}
-					default:
-						return ErrInvalidID
-					}
-					return nil
-				}
-			}
-		}
-		return nil
-	}), condition)
+	// Rebuild the query
+	shardedQuery, err := pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{&pg_query.RawStmt{Stmt: stmt}}})
 	if err != nil {
+		return ftQuery, stQuery, "", fmt.Errorf("failed to rebuild query: %v", err)
+	}
+
+	return ftQuery, shardedQuery, "", nil
+}
+
+// extractTables traverses the AST and collects all table names involved in the query.
+func (s *Sharding) extractTables(node *pg_query.Node) []Table {
+	var tables []Table
+	s.extractTablesRecursive(node, &tables)
+	return tables
+}
+
+func (s *Sharding) extractTablesRecursive(node *pg_query.Node, tables *[]Table) {
+	if node == nil {
 		return
 	}
 
-	if !keyFind && id == 0 {
-		return nil, 0, keyFind, ErrMissingShardingKey
+	switch n := node.Node.(type) {
+	case *pg_query.Node_RangeVar:
+		tableName := n.RangeVar.Relname
+		alias := ""
+		if n.RangeVar.Alias != nil {
+			alias = n.RangeVar.Alias.Aliasname
+		}
+		*tables = append(*tables, Table{Name: tableName, Alias: alias})
 	}
 
-	return
+	for _, child := range s.getChildNodes(node) {
+		s.extractTablesRecursive(child, tables)
+	}
 }
 
-func replaceOrderByTableName(orderBy []*sqlparser.OrderingTerm, oldName, newName string) []*sqlparser.OrderingTerm {
-	for i, term := range orderBy {
-		if x, ok := term.X.(*sqlparser.QualifiedRef); ok {
-			if x.Table.Name == oldName {
-				x.Table.Name = newName
-				orderBy[i].X = x
+func (s *Sharding) getChildNodes(node *pg_query.Node) []*pg_query.Node {
+	var children []*pg_query.Node
+
+	// Recursively extract child nodes based on the node type
+	switch n := node.Node.(type) {
+	case *pg_query.Node_SelectStmt:
+		children = append(children, n.SelectStmt.FromClause...)
+		if n.SelectStmt.WhereClause != nil {
+			children = append(children, n.SelectStmt.WhereClause)
+		}
+		if n.SelectStmt.TargetList != nil {
+			children = append(children, n.SelectStmt.TargetList...)
+		}
+	case *pg_query.Node_InsertStmt:
+		// Wrap Relation (*RangeVar) into a *pg_query.Node
+		if n.InsertStmt.Relation != nil {
+			children = append(children, &pg_query.Node{
+				Node: &pg_query.Node_RangeVar{
+					RangeVar: n.InsertStmt.Relation,
+				},
+			})
+		}
+		if n.InsertStmt.SelectStmt != nil {
+			children = append(children, n.InsertStmt.SelectStmt)
+		}
+		if n.InsertStmt.WithClause != nil {
+			children = append(children, n.InsertStmt.WithClause.Ctes...)
+		}
+	case *pg_query.Node_UpdateStmt:
+		children = append(children, n.UpdateStmt.FromClause...)
+		if n.UpdateStmt.WhereClause != nil {
+			children = append(children, n.UpdateStmt.WhereClause)
+		}
+	case *pg_query.Node_DeleteStmt:
+		children = append(children, n.DeleteStmt.UsingClause...)
+		if n.DeleteStmt.WhereClause != nil {
+			children = append(children, n.DeleteStmt.WhereClause)
+		}
+	case *pg_query.Node_JoinExpr:
+		children = append(children, n.JoinExpr.Larg)
+		children = append(children, n.JoinExpr.Rarg)
+		if n.JoinExpr.Quals != nil {
+			children = append(children, n.JoinExpr.Quals)
+		}
+	case *pg_query.Node_RangeSubselect:
+		if n.RangeSubselect.Subquery != nil {
+			children = append(children, n.RangeSubselect.Subquery)
+		}
+	case *pg_query.Node_CommonTableExpr:
+		if n.CommonTableExpr.Ctequery != nil {
+			children = append(children, n.CommonTableExpr.Ctequery)
+		}
+		// Add more cases as necessary
+	}
+
+	return children
+}
+
+// getShardingKeyValue extracts the sharding key value from the query.
+func (s *Sharding) getShardingKeyValue(stmt *pg_query.Node, table Table, config Config, args []any) (any, int64, bool, error) {
+	var keyValue any
+	var id int64
+	var keyFound bool
+
+	// Traverse the WHERE clause to find the sharding key
+	conditions := s.extractConditions(stmt, table)
+
+	for _, cond := range conditions {
+		if cond.ColumnName == config.ShardingKey {
+			if cond.Operator == "=" {
+				keyValue = cond.Value
+				keyFound = true
+				break
+			}
+		} else if cond.ColumnName == "id" {
+			if cond.Operator == "=" {
+				switch v := cond.Value.(type) {
+				case int64:
+					id = v
+				case int32:
+					id = int64(v)
+				case int:
+					id = int64(v)
+				case string:
+					var err error
+					id, err = strconv.ParseInt(v, 10, 64)
+					if err != nil {
+						return nil, 0, false, ErrInvalidID
+					}
+				default:
+					return nil, 0, false, ErrInvalidID
+				}
 			}
 		}
 	}
 
-	return orderBy
+	if !keyFound && id == 0 {
+		return nil, 0, false, ErrMissingShardingKey
+	}
+
+	return keyValue, id, keyFound, nil
+}
+
+type Condition struct {
+	ColumnName string
+	Operator   string
+	Value      any
+}
+
+func (s *Sharding) extractConditions(node *pg_query.Node, table Table) []Condition {
+	var conditions []Condition
+	s.extractConditionsRecursive(node, table, &conditions)
+	return conditions
+}
+
+func (s *Sharding) extractConditionsRecursive(node *pg_query.Node, table Table, conditions *[]Condition) {
+	if node == nil {
+		return
+	}
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_AExpr:
+		if n.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP {
+			if len(n.AExpr.Name) == 1 {
+				operatorNode := n.AExpr.Name[0].Node.(*pg_query.Node_String_)
+				operator := operatorNode.String_.Sval
+
+				// Left operand
+				var columnName string
+				if col, ok := n.AExpr.Lexpr.Node.(*pg_query.Node_ColumnRef); ok {
+					if len(col.ColumnRef.Fields) > 0 {
+						fieldNode := col.ColumnRef.Fields[len(col.ColumnRef.Fields)-1]
+						if fieldStr, ok := fieldNode.Node.(*pg_query.Node_String_); ok {
+							columnName = fieldStr.String_.Sval
+						}
+					}
+				}
+
+				// Right operand
+				var value any
+				if constNode, ok := n.AExpr.Rexpr.Node.(*pg_query.Node_AConst); ok {
+					value = s.extractConstValue(constNode)
+				}
+
+				// Add condition if the column is from the target table
+				if columnName != "" {
+					*conditions = append(*conditions, Condition{
+						ColumnName: columnName,
+						Operator:   operator,
+						Value:      value,
+					})
+				}
+			}
+		}
+	}
+
+	for _, child := range s.getChildNodes(node) {
+		s.extractConditionsRecursive(child, table, conditions)
+	}
+}
+
+// extractConstValue extracts the value from an A_Const node
+func (s *Sharding) extractConstValue(constNode *pg_query.Node_AConst) any {
+	valNode := constNode.AConst
+	//switch v := valNode.Val.(type) {
+	//case *pg_query.A_Const_Ival:
+	//	return v.Ival
+	//case *pg_query.A_Const_Fval:
+	//	return v.Fval
+	//case *pg_query.Node_String_:
+	//	return v.String_.Sval
+	//case *pg_query.NullIfExpr:
+	//	return nil
+	//default:
+	//	return nil
+	//}
+	return valNode.GetVal()
+}
+
+// replaceTableName replaces table names in the AST with sharded table names.
+func (s *Sharding) replaceTableName(node *pg_query.Node, oldName, newName string) {
+	if node == nil {
+		return
+	}
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_RangeVar:
+		if n.RangeVar.Relname == oldName {
+			n.RangeVar.Relname = newName
+		}
+	case *pg_query.Node_ColumnRef:
+		// Replace table name in column references if necessary
+		fields := n.ColumnRef.Fields
+		if len(fields) > 1 {
+			if tblNode, ok := fields[0].Node.(*pg_query.Node_String_); ok {
+				if tblNode.String_.Sval == oldName {
+					tblNode.String_.Sval = newName
+				}
+			}
+		}
+	}
+
+	for _, child := range s.getChildNodes(node) {
+		s.replaceTableName(child, oldName, newName)
+	}
+}
+
+// getTableFormat determines the table format string based on the number of shards.
+func getTableFormat(numberOfShards uint) string {
+	switch {
+	case numberOfShards < 10:
+		return "_%01d"
+	case numberOfShards < 100:
+		return "_%02d"
+	case numberOfShards < 1000:
+		return "_%03d"
+	case numberOfShards < 10000:
+		return "_%04d"
+	default:
+		return "_%d"
+	}
+}
+
+// defaultShardingAlgorithm provides a default sharding algorithm using modulus.
+func defaultShardingAlgorithm(c Config) func(any) (string, error) {
+	return func(value any) (string, error) {
+		var id int
+		var err error
+		switch v := value.(type) {
+		case int:
+			id = v
+		case int64:
+			id = int(v)
+		case int32:
+			id = int(v)
+		case int16:
+			id = int(v)
+		case uint:
+			id = int(v)
+		case uint64:
+			id = int(v)
+		case uint32:
+			id = int(v)
+		case uint16:
+			id = int(v)
+		case string:
+			id, err = strconv.Atoi(v)
+			if err != nil {
+				id = int(crc32Checksum(v))
+			}
+		default:
+			return "", errors.New("unsupported sharding key type")
+		}
+		suffix := fmt.Sprintf(c.tableFormat, id%int(c.NumberOfShards))
+		return suffix, nil
+	}
+}
+
+// defaultShardingSuffixes generates all possible sharding suffixes.
+func defaultShardingSuffixes(c Config) func() []string {
+	return func() []string {
+		suffixes := make([]string, c.NumberOfShards)
+		for i := 0; i < int(c.NumberOfShards); i++ {
+			suffixes[i] = fmt.Sprintf(c.tableFormat, i)
+		}
+		return suffixes
+	}
+}
+
+// crc32Checksum computes the CRC32 checksum of a string.
+func crc32Checksum(s string) uint32 {
+	return crc32.ChecksumIEEE([]byte(s))
 }
