@@ -234,7 +234,6 @@ func (s *Sharding) resolve(query string, args ...any) (string, string, string, e
 	return ftQuery, shardedQuery, "", nil
 }
 
-// extractTables traverses the AST and collects all table names involved in the query.
 func (s *Sharding) extractTables(node *pg_query.Node) []Table {
 	var tables []Table
 	s.extractTablesRecursive(node, &tables)
@@ -274,8 +273,10 @@ func (s *Sharding) getChildNodes(node *pg_query.Node) []*pg_query.Node {
 		if n.SelectStmt.TargetList != nil {
 			children = append(children, n.SelectStmt.TargetList...)
 		}
+		if n.SelectStmt.WithClause != nil {
+			children = append(children, n.SelectStmt.WithClause.Ctes...)
+		}
 	case *pg_query.Node_InsertStmt:
-		// Wrap Relation (*RangeVar) into a *pg_query.Node
 		if n.InsertStmt.Relation != nil {
 			children = append(children, &pg_query.Node{
 				Node: &pg_query.Node_RangeVar{
@@ -289,19 +290,49 @@ func (s *Sharding) getChildNodes(node *pg_query.Node) []*pg_query.Node {
 		if n.InsertStmt.WithClause != nil {
 			children = append(children, n.InsertStmt.WithClause.Ctes...)
 		}
+		if n.InsertStmt.ReturningList != nil {
+			children = append(children, n.InsertStmt.ReturningList...)
+		}
 	case *pg_query.Node_UpdateStmt:
+		if n.UpdateStmt.Relation != nil {
+			children = append(children, &pg_query.Node{
+				Node: &pg_query.Node_RangeVar{
+					RangeVar: n.UpdateStmt.Relation,
+				},
+			})
+		}
 		children = append(children, n.UpdateStmt.FromClause...)
 		if n.UpdateStmt.WhereClause != nil {
 			children = append(children, n.UpdateStmt.WhereClause)
 		}
+		if n.UpdateStmt.TargetList != nil {
+			children = append(children, n.UpdateStmt.TargetList...)
+		}
+		if n.UpdateStmt.WithClause != nil {
+			children = append(children, n.UpdateStmt.WithClause.Ctes...)
+		}
 	case *pg_query.Node_DeleteStmt:
+		if n.DeleteStmt.Relation != nil {
+			children = append(children, &pg_query.Node{
+				Node: &pg_query.Node_RangeVar{
+					RangeVar: n.DeleteStmt.Relation,
+				},
+			})
+		}
 		children = append(children, n.DeleteStmt.UsingClause...)
 		if n.DeleteStmt.WhereClause != nil {
 			children = append(children, n.DeleteStmt.WhereClause)
 		}
+		if n.DeleteStmt.WithClause != nil {
+			children = append(children, n.DeleteStmt.WithClause.Ctes...)
+		}
 	case *pg_query.Node_JoinExpr:
-		children = append(children, n.JoinExpr.Larg)
-		children = append(children, n.JoinExpr.Rarg)
+		if n.JoinExpr.Larg != nil {
+			children = append(children, n.JoinExpr.Larg)
+		}
+		if n.JoinExpr.Rarg != nil {
+			children = append(children, n.JoinExpr.Rarg)
+		}
 		if n.JoinExpr.Quals != nil {
 			children = append(children, n.JoinExpr.Quals)
 		}
@@ -313,7 +344,6 @@ func (s *Sharding) getChildNodes(node *pg_query.Node) []*pg_query.Node {
 		if n.CommonTableExpr.Ctequery != nil {
 			children = append(children, n.CommonTableExpr.Ctequery)
 		}
-		// Add more cases as necessary
 	}
 
 	return children
